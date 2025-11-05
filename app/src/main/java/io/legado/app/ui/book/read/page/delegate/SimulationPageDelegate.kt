@@ -235,7 +235,8 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                 (1 - touchY) // 防止mTouchY最终变为0
             }
         }
-        startScroll(touchX.toInt(), touchY.toInt(), dx.toInt(), dy.toInt(), animationSpeed)
+        val speed = 200 // 这里设置你想要的速度，200ms比较快
+        startScroll(touchX.toInt(), touchY.toInt(), dx.toInt(), dy.toInt(), speed)
     }
 
     override fun onAnimStop() {
