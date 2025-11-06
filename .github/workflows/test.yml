@@ -70,11 +70,6 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: 17
-      - name: Clean Gradle Cache
-        run: |
-          rm -rf ~/.gradle/caches
-          rm -rf $GITHUB_WORKSPACE/.gradle
-          rm -rf $GITHUB_WORKSPACE/app/build
       - name: Clear 18PlusList.txt
         run: |
           echo "清空18PlusList.txt"
@@ -90,8 +85,6 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
-        with:
-          cache-cleanup: always
 
       - name: Build With Gradle
         continue-on-error: true
@@ -107,24 +100,7 @@ jobs:
           sed "/def version/c def version = \"${{ env.VERSION }}\"" $GITHUB_WORKSPACE/app/build.gradle  -i
           echo "开始${{ env.product }}$typeName构建"
           chmod +x gradlew
-          
-          # 清理并重新构建，显示详细日志
-          ./gradlew clean
-          echo "=== 开始构建，显示详细日志 ==="
-          ./gradlew assemble${{ env.product }}release --build-cache --parallel --daemon --warning-mode all --refresh-dependencies --info --stacktrace 2>&1 | tee build.log || true
-          
-          # 检查APK文件是否生成
-          if find ${{ github.workspace }}/app/build/outputs/apk -name "*.apk" 2>/dev/null | grep -q .; then
-            echo "=== 构建成功，找到APK文件 ==="
-            find ${{ github.workspace }}/app/build/outputs/apk -name "*.apk"
-          else
-            echo "=== 构建失败，显示错误日志 ==="
-            cat build.log
-            echo "=== 检查构建输出目录 ==="
-            find ${{ github.workspace }}/app/build -type d
-            exit 1
-          fi
-          
+          ./gradlew assemble${{ env.product }}release --build-cache --parallel --daemon --warning-mode all
           echo "修改APK文件名"
           mkdir -p ${{ github.workspace }}/apk/
           for file in `ls ${{ github.workspace }}/app/build/outputs/apk/*/*/*.apk`; do
@@ -135,15 +111,6 @@ jobs:
           for file in `ls ${{ github.workspace }}/app/build/outputs/mapping/*/mapping.txt`; do
             mv "$file" ${{ github.workspace }}/mapping/mapping.txt
           done
-
-      - name: Upload Build Logs
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-logs-${{ env.product }}-${{ env.type }}
-          path: |
-            ${{ github.workspace }}/build.log
-            ${{ github.workspace }}/app/build/
 
       - name: Move Missing Rules Files
         run: |
