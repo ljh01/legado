@@ -70,6 +70,11 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: 17
+      - name: Clean Gradle Cache
+        run: |
+          rm -rf ~/.gradle/caches
+          rm -rf $GITHUB_WORKSPACE/.gradle
+          rm -rf $GITHUB_WORKSPACE/app/build
       - name: Clear 18PlusList.txt
         run: |
           echo "清空18PlusList.txt"
@@ -85,6 +90,8 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-cleanup: always
 
       - name: Build With Gradle
         continue-on-error: true
@@ -100,7 +107,11 @@ jobs:
           sed "/def version/c def version = \"${{ env.VERSION }}\"" $GITHUB_WORKSPACE/app/build.gradle  -i
           echo "开始${{ env.product }}$typeName构建"
           chmod +x gradlew
-          ./gradlew assemble${{ env.product }}release --build-cache --parallel --daemon --warning-mode all
+          
+          # 清理并重新构建
+          ./gradlew clean
+          ./gradlew assemble${{ env.product }}release --build-cache --parallel --daemon --warning-mode all --refresh-dependencies
+          
           echo "修改APK文件名"
           mkdir -p ${{ github.workspace }}/apk/
           for file in `ls ${{ github.workspace }}/app/build/outputs/apk/*/*/*.apk`; do
