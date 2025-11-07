@@ -1,31 +1,19 @@
 package io.legado.app.ui.book.read.page.delegate
 
-import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.ColorMatrix
-import android.graphics.ColorMatrixColorFilter
-import android.graphics.Matrix
-import android.graphics.Paint
-import android.graphics.Path
-import android.graphics.PointF
-import android.graphics.Region
+import android.graphics.*
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
+import android.view.Choreographer
 import android.view.MotionEvent
 import io.legado.app.help.config.ReadBookConfig
 import io.legado.app.ui.book.read.page.ReadView
 import io.legado.app.ui.book.read.page.entities.PageDirection
 import io.legado.app.utils.screenshot
-import kotlin.math.abs
-import kotlin.math.atan2
-import kotlin.math.cos
-import kotlin.math.hypot
-import kotlin.math.min
-import kotlin.math.sin
+import kotlin.math.*
 
 @Suppress("DEPRECATION")
 class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
-    //不让x,y为0,否则在点计算时会有问题
+    // 不让x,y为0,否则在点计算时会有问题
     private var mTouchX = 0.1f
     private var mTouchY = 0.1f
 
@@ -35,30 +23,15 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
     private val mPath0: Path = Path()
     private val mPath1: Path = Path()
 
-    // 贝塞尔曲线起始点
+    // 贝塞尔曲线起始点/控制点/顶点/结束点（复用，避免每帧分配）
     private val mBezierStart1 = PointF()
-
-    // 贝塞尔曲线控制点
     private val mBezierControl1 = PointF()
-
-    // 贝塞尔曲线顶点
     private val mBezierVertex1 = PointF()
-
-    // 贝塞尔曲线结束点
-    private var mBezierEnd1 = PointF()
-
-    // 另一条贝塞尔曲线
-    // 贝塞尔曲线起始点
+    private val mBezierEnd1 = PointF()
     private val mBezierStart2 = PointF()
-
-    // 贝塞尔曲线控制点
     private val mBezierControl2 = PointF()
-
-    // 贝塞尔曲线顶点
     private val mBezierVertex2 = PointF()
-
-    // 贝塞尔曲线结束点
-    private var mBezierEnd2 = PointF()
+    private val mBezierEnd2 = PointF()
 
     private var mMiddleX = 0f
     private var mMiddleY = 0f
@@ -81,18 +54,13 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
     private var mIsRtOrLb = false
     private var mMaxLength = hypot(viewWidth.toDouble(), viewHeight.toDouble()).toFloat()
 
-    // 背面颜色组
+    // 背面/前面颜色组 & 阴影Drawable（已缓存）
     private var mBackShadowColors: IntArray
-
-    // 前面颜色组
     private var mFrontShadowColors: IntArray
-
-    // 有阴影的GradientDrawable
     private var mBackShadowDrawableLR: GradientDrawable
     private var mBackShadowDrawableRL: GradientDrawable
     private var mFolderShadowDrawableLR: GradientDrawable
     private var mFolderShadowDrawableRL: GradientDrawable
-
     private var mFrontShadowDrawableHBT: GradientDrawable
     private var mFrontShadowDrawableHTB: GradientDrawable
     private var mFrontShadowDrawableVLR: GradientDrawable
@@ -100,13 +68,31 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
 
     private val mPaint: Paint = Paint().apply { style = Paint.Style.FILL }
 
+    // Bitmap 缓存与标记
     private var curBitmap: Bitmap? = null
     private var prevBitmap: Bitmap? = null
     private var nextBitmap: Bitmap? = null
-    private var canvas: Canvas = Canvas()
+    private var canvasTmp: Canvas = Canvas()
+
+    // 防抖阈值（像素），减少不必要的计算
+    private val MIN_MOVE_THRESHOLD = 0.5f
+    private var lastCalcTouchX = -10000f
+    private var lastCalcTouchY = -10000f
+
+    // 用 choreographer 驱动渲染（跟随屏幕刷新率）
+    private val choreographer = Choreographer.getInstance()
+    private val frameCallback = object : Choreographer.FrameCallback {
+        override fun doFrame(frameTimeNanos: Long) {
+            if (isRunning) {
+                // 当 isRunning 为 true 时持续回调（只回调一次下一帧，避免重复注册）
+                readView.invalidate()
+                choreographer.postFrameCallback(this)
+            }
+        }
+    }
 
     init {
-        //设置颜色数组
+        // 设置颜色数组
         val color = intArrayOf(0x333333, -0x4fcccccd)
         mFolderShadowDrawableRL = GradientDrawable(GradientDrawable.Orientation.RIGHT_LEFT, color)
         mFolderShadowDrawableRL.gradientType = GradientDrawable.LINEAR_GRADIENT
@@ -141,16 +127,39 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
         mFrontShadowDrawableHBT.gradientType = GradientDrawable.LINEAR_GRADIENT
     }
 
+    // ------------------------------
+    // Bitmap 缓存策略：仅在 page 变化时截图
+    // ------------------------------
+    private var lastCurPageId: Int = -1
+    private var lastPrevPageId: Int = -1
+    private var lastNextPageId: Int = -1
+
     override fun setBitmap() {
         when (mDirection) {
             PageDirection.PREV -> {
-                prevBitmap = prevPage.screenshot(prevBitmap, canvas)
-                curBitmap = curPage.screenshot(curBitmap, canvas)
+                val curId = curPage.hashCode()
+                val prevId = prevPage.hashCode()
+                if (prevBitmap == null || prevId != lastPrevPageId) {
+                    prevBitmap = prevPage.screenshot(prevBitmap, canvasTmp)
+                    lastPrevPageId = prevId
+                }
+                if (curBitmap == null || curId != lastCurPageId) {
+                    curBitmap = curPage.screenshot(curBitmap, canvasTmp)
+                    lastCurPageId = curId
+                }
             }
 
             PageDirection.NEXT -> {
-                nextBitmap = nextPage.screenshot(nextBitmap, canvas)
-                curBitmap = curPage.screenshot(curBitmap, canvas)
+                val curId = curPage.hashCode()
+                val nextId = nextPage.hashCode()
+                if (nextBitmap == null || nextId != lastNextPageId) {
+                    nextBitmap = nextPage.screenshot(nextBitmap, canvasTmp)
+                    lastNextPageId = nextId
+                }
+                if (curBitmap == null || curId != lastCurPageId) {
+                    curBitmap = curPage.screenshot(curBitmap, canvasTmp)
+                    lastCurPageId = curId
+                }
             }
 
             else -> Unit
@@ -167,8 +176,12 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
                 calcCornerXY(event.x, event.y)
+                // 触摸开始时马上开始帧驱动（若尚未）
+                if (!isRunning) {
+                    isRunning = true
+                    choreographer.postFrameCallback(frameCallback)
+                }
             }
-
             MotionEvent.ACTION_MOVE -> {
                 if ((startY > viewHeight / 3 && startY < viewHeight * 2 / 3)
                     || mDirection == PageDirection.PREV
@@ -182,6 +195,9 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                     readView.touchY = 1f
                 }
             }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                // 如果手抬起就进入动画（onAnimStart 会被调用），否则终止驱动
+            }
         }
     }
 
@@ -189,7 +205,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
         super.setDirection(direction)
         when (direction) {
             PageDirection.PREV ->
-                //上一页滑动不出现对角
+                // 上一页滑动不出现对角
                 if (startX > viewWidth / 2) {
                     calcCornerXY(startX, viewHeight.toFloat())
                 } else {
@@ -208,7 +224,6 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
     override fun onAnimStart(animationSpeed: Int) {
         var dx: Float
         val dy: Float
-        // dy 垂直方向滑动的距离，负值会使滚动向上滚动
         if (isCancel) {
             dx = if (mCornerX > 0 && mDirection == PageDirection.NEXT) {
                 (viewWidth - touchX)
@@ -235,11 +250,25 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                 (1 - touchY) // 防止mTouchY最终变为0
             }
         }
+
+        // note: 保持 startScroll 行为不变，但启动帧驱动
         val speed = 200 // 这里设置你想要的速度，200ms比较快
         startScroll(touchX.toInt(), touchY.toInt(), dx.toInt(), dy.toInt(), speed)
+
+        // 开始 choreographer 驱动（如果未启动）
+        if (!isRunning) {
+            isRunning = true
+            choreographer.postFrameCallback(frameCallback)
+        }
     }
 
     override fun onAnimStop() {
+        // 停止帧驱动
+        if (isRunning) {
+            isRunning = false
+            choreographer.removeFrameCallback(frameCallback)
+        }
+
         if (!isCancel) {
             readView.fillPage(mDirection)
         }
@@ -247,9 +276,14 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
 
     override fun onDraw(canvas: Canvas) {
         if (!isRunning) return
+
+        // 建议宿主 View 在初始化时调用 setLayerType(LAYER_TYPE_HARDWARE, null)
+        // 提升 GPU 绘制性能
+        canvas.drawFilter = PaintFlagsDrawFilter(0, Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+
         when (mDirection) {
             PageDirection.NEXT -> {
-                calcPoints()
+                calcPointsIfNeeded()
                 drawCurrentPageArea(canvas, curBitmap)
                 drawNextPageAreaAndShadow(canvas, nextBitmap)
                 drawCurrentPageShadow(canvas)
@@ -257,7 +291,7 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             }
 
             PageDirection.PREV -> {
-                calcPoints()
+                calcPointsIfNeeded()
                 drawCurrentPageArea(canvas, prevBitmap)
                 drawNextPageAreaAndShadow(canvas, curBitmap)
                 drawCurrentPageShadow(canvas)
@@ -518,10 +552,20 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
                 || (mCornerY == 0 && mCornerX == viewWidth)
     }
 
-    private fun calcPoints() {
+    // 只在需要时计算（结合移动防抖）
+    private fun calcPointsIfNeeded() {
         mTouchX = touchX
         mTouchY = touchY
+        if (abs(mTouchX - lastCalcTouchX) < MIN_MOVE_THRESHOLD && abs(mTouchY - lastCalcTouchY) < MIN_MOVE_THRESHOLD) {
+            return
+        }
+        lastCalcTouchX = mTouchX
+        lastCalcTouchY = mTouchY
+        calcPoints()
+    }
 
+    private fun calcPoints() {
+        // 复制原 calcPoints 的实现，但避免分配新的PointF
         mMiddleX = (mTouchX + mCornerX) / 2
         mMiddleY = (mTouchY + mCornerY) / 2
         mBezierControl1.x =
@@ -582,14 +626,9 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
             (mTouchY - mCornerY).toDouble()
         ).toFloat()
 
-        mBezierEnd1 = getCross(
-            PointF(mTouchX, mTouchY), mBezierControl1, mBezierStart1,
-            mBezierStart2
-        )
-        mBezierEnd2 = getCross(
-            PointF(mTouchX, mTouchY), mBezierControl2, mBezierStart1,
-            mBezierStart2
-        )
+        // 这里复用 mBezierEnd1 / mBezierEnd2，避免分配
+        getCross(mBezierEnd1, PointF(mTouchX, mTouchY), mBezierControl1, mBezierStart1, mBezierStart2)
+        getCross(mBezierEnd2, PointF(mTouchX, mTouchY), mBezierControl2, mBezierStart1, mBezierStart2)
 
         mBezierVertex1.x = (mBezierStart1.x + 2 * mBezierControl1.x + mBezierEnd1.x) / 4
         mBezierVertex1.y = (2 * mBezierControl1.y + mBezierStart1.y + mBezierEnd1.y) / 4
@@ -598,17 +637,18 @@ class SimulationPageDelegate(readView: ReadView) : HorizontalPageDelegate(readVi
     }
 
     /**
-     * 求解直线P1P2和直线P3P4的交点坐标
+     * 求解直线P1P2和直线P3P4的交点坐标（将结果写入 out，避免分配）
      */
-    private fun getCross(P1: PointF, P2: PointF, P3: PointF, P4: PointF): PointF {
-        val crossP = PointF()
-        // 二元函数通式： y=ax+b
-        val a1 = (P2.y - P1.y) / (P2.x - P1.x)
-        val b1 = (P1.x * P2.y - P2.x * P1.y) / (P1.x - P2.x)
-        val a2 = (P4.y - P3.y) / (P4.x - P3.x)
-        val b2 = (P3.x * P4.y - P4.x * P3.y) / (P3.x - P4.x)
-        crossP.x = (b2 - b1) / (a1 - a2)
-        crossP.y = a1 * crossP.x + b1
-        return crossP
+    private fun getCross(out: PointF, P1: PointF, P2: PointF, P3: PointF, P4: PointF) {
+        // 防止除以0：若两点x相同则微调
+        val denom1 = (P2.x - P1.x).takeIf { it != 0f } ?: 0.0001f
+        val denom2 = (P4.x - P3.x).takeIf { it != 0f } ?: 0.0001f
+
+        val a1 = (P2.y - P1.y) / denom1
+        val b1 = (P1.x * P2.y - P2.x * P1.y) / (P1.x - P2.x + 0.0001f)
+        val a2 = (P4.y - P3.y) / denom2
+        val b2 = (P3.x * P4.y - P4.x * P3.y) / (P3.x - P4.x + 0.0001f)
+        out.x = (b2 - b1) / (a1 - a2 + 0.0001f)
+        out.y = a1 * out.x + b1
     }
 }
