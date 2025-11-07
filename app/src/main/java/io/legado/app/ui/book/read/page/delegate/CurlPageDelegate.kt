@@ -5,57 +5,61 @@ import android.view.MotionEvent
 import androidx.core.graphics.withSave
 import io.legado.app.ui.book.read.page.ReadView
 import io.legado.app.ui.book.read.page.entities.PageDirection
-import io.legado.app.utils.screenshot
 import kotlin.math.*
 
 /**
- * 高级贝塞尔纸张卷曲翻页（Google Books 风格）
- * 继承 HorizontalPageDelegate（使用 curRecorder/nextRecorder/prevRecorder）
+ * CurlPageDelegate - 基于 Bitmap mesh 的贝塞尔/正弦弯曲纸页翻页（接近 Google Play Books / 静读天下）
  *
- * 实现要点：
- * - 使用贝塞尔确定折叠轴和折叠区（fold）
- * - frontRegion: 未折叠的部分（裁剪后绘制 curRecorder）
- * - foldRegion: 折叠部分，绘制当前页背面（半透明）并对其进行 Matrix/Camera 变形
- * - 渐变阴影沿折叠边缘增强立体感
+ * 设计说明（要点）：
+ *  - 使用 curPage.draw(bitmapCanvas) 生成当前页 bitmap（避免依赖不可预知的 recorder bitmap API）
+ *  - 将 bitmap 按网格分段，通过 drawBitmapMesh 实现“纸张沿竖直方向弯曲”的视觉（y = H * sin(pi * x / width)）
+ *  - 同时对背面区域使用半透明冷色叠加以模拟纸的背面
+ *  - 阴影使用 LinearGradient 渐变，位置随折叠线（foldX）移动
+ *
+ * 注意：此实现力求在 Canvas 环境中达到高逼真度，性能取决于 mesh 划分密度（meshCols）及设备。
  */
 class CurlPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
 
+    // 绘制画笔
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val highlightPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val matrix = Matrix()
-    private val camera = Camera()
+    private val backPaint = Paint(Paint.ANTI_ALIAS_FLAG)
 
-    // path 用于裁剪
-    private val pathFold = Path()
-    private val pathFront = Path()
+    // mesh 参数（可调）
+    private val meshCols = 40      // 网格列数（越大更平滑，性能越差）
+    private val meshRows = 1       // 只在竖直方向变形，用一行网格即可
+    private val maxCurve = 0.35f   // 最大弧高（相对于 viewHeight 的比例），可调 0.1 ~ 0.5
 
-    // 临时 RectF
-    private val tmpRect = RectF()
+    // 临时缓存 bitmap（避免频繁分配）
+    private var pageBitmap: Bitmap? = null
+    private var pageBitmapCanvas: Canvas? = null
+    private var meshVerts: FloatArray? = null
 
-    // 控制参数
+    // 折叠控制
     private var cornerX = 0f
     private var cornerY = 0f
-    private val maxShadowWidth = 120f
 
     init {
         paint.style = Paint.Style.FILL
+        // 阴影（将按 fold 方向绘制）
         shadowPaint.shader = LinearGradient(
             0f, 0f, 200f, 0f,
             intArrayOf(0x99000000.toInt(), 0x22000000.toInt(), 0x00000000),
             floatArrayOf(0f, 0.5f, 1f),
             Shader.TileMode.CLAMP
         )
-        highlightPaint.color = 0x22FFFFFF
+        // 背面颜色（冷灰），半透明
+        backPaint.colorFilter = null
+        backPaint.alpha = 220
     }
 
-    // 触摸处理：按下决定方向，move 更新 touch，up 发起动画
+    // --- 手势处理 ---
     override fun onTouch(event: MotionEvent) {
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
                 abortAnim()
-                // 决定方向：右半屏向左翻，左半屏向右翻
-                val dragToLeft = event.x > viewWidth / 2
+                // 决定翻页方向：右半屏向左（NEXT），左半屏向右（PREV）
+                val dragToLeft = event.x > viewWidth / 2f
                 if (dragToLeft) {
                     if (!hasNext()) return
                     setDirection(PageDirection.NEXT)
@@ -68,210 +72,230 @@ class CurlPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
                 cornerY = viewHeight.toFloat()
                 readView.setStartPoint(event.x, event.y, false)
                 isRunning = true
+                // 生成或更新 bitmap 缓存
+                ensurePageBitmap()
+                // 截图当前页到 bitmap
+                curPage.draw(pageBitmapCanvas)
             }
 
             MotionEvent.ACTION_MOVE -> {
                 if (isRunning) {
                     readView.setTouchPoint(event.x, event.y)
+                    // 每次移动可以更新 bitmap（如果你用 recorder 直接提供 bitmap 可跳过）
+                    // curPage.draw(pageBitmapCanvas) // 可选：减小频率以提升性能
                 }
             }
 
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 if (!isRunning) return
-                // 计算拖动是否足以翻页
-                val dx = cornerX - touchX
-                val dy = cornerY - touchY
-                val dist = sqrt(dx * dx + dy * dy)
-                val ratio = dist / viewWidth
-                // 若拖动小于阈值则回弹（isCancel = true）
-                isCancel = ratio < 0.45f
+                // 判断是否完成翻页（水平拖动阈值）
+                val dragDist = abs(touchX - startX)
+                isCancel = dragDist < viewWidth * 0.25f
+                // 启动收尾动画
                 onAnimStart(readView.defaultAnimationSpeed)
             }
         }
     }
 
-    /**
-     * 绘制过程分三步：
-     * 1) 背景页（next/prev） -> 在未被折叠处可见
-     * 2) 当前页 frontRegion（未折叠部分） -> 裁剪后绘制 curRecorder
-     * 3) 折叠区域 foldRegion -> 在 layer 上对 curRecorder 做变换并绘制背面与阴影
-     */
+    // --- 绘制：background -> front (未折叠) -> folded mesh -> backface tint -> shadow ---
     override fun onDraw(canvas: Canvas) {
-        // 如果没有运行动画/交互 -> 直接绘制当前页
+        // 非交互时直接绘制当前页
         if (!isRunning) {
             curRecorder.draw(canvas)
             return
         }
 
-        // 1) 绘制背景（下一页或上一页）
+        // 1. 绘制背景页（先绘制被揭露的目标页）
         when (mDirection) {
             PageDirection.NEXT -> nextRecorder.draw(canvas)
             PageDirection.PREV -> prevRecorder.draw(canvas)
             else -> curRecorder.draw(canvas)
         }
 
-        // 计算 fold 参数
-        val fx = touchX.coerceIn(0f, viewWidth.toFloat())
-        val fy = touchY.coerceIn(0f, viewHeight.toFloat())
-        // 折叠中心点（接近手指）
-        val cx = fx
-        val cy = fy
+        // 确保 bitmap 可用
+        ensurePageBitmap()
 
-        // 折叠轴：从 top 到 bottom，近似一条垂直于书脊的贝塞尔线（可改为更复杂）
-        // 为更自然：使用控制点使轴线从右向左弯曲
-        // controlOffset 控制“鼓起”高度（与拖动距离成正比）
-        val baseDist = abs(cornerX - cx)
-        val controlOffset = (baseDist / viewWidth) * (viewHeight / 2f) // 控制弧高
-        val ctrlX = (cornerX + cx) / 2f + if (mDirection == PageDirection.NEXT) -controlOffset else controlOffset
-        val ctrlY = viewHeight / 2f
+        val bmp = pageBitmap ?: return
 
-        // 构造折叠 Path（foldRegion）
-        pathFold.reset()
-        // 折叠区域用一条二次贝塞尔线描述上边界和下边界
-        // 上边界
-        pathFold.moveTo(cx, 0f)
-        pathFold.quadTo(ctrlX, ctrlY - controlOffset * 0.2f, cornerX, 0f)
-        // 右/左侧到下边界
-        pathFold.lineTo(cornerX, viewHeight.toFloat())
-        // 下边界（反向贝塞尔）
-        pathFold.quadTo(ctrlX, ctrlY + controlOffset * 0.2f, cx, viewHeight.toFloat())
-        pathFold.close()
+        // 计算 fold 关键变量
+        val fx = touchX.coerceIn(0f, viewWidth.toFloat())   // 手指X
+        val fy = touchY.coerceIn(0f, viewHeight.toFloat())  // 手指Y
+        val baseDist = abs(cornerX - fx)
+        // H 控制弧高，相对 viewHeight
+        val H = (min(maxCurve, 0.75f * (1f - baseDist / viewWidth)) * viewHeight).coerceAtLeast(0f)
 
-        // frontRegion = 全页 - foldRegion
-        pathFront.reset()
-        pathFront.addRect(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat(), Path.Direction.CW)
-        pathFront.op(pathFold, Path.Op.DIFFERENCE)
+        // foldX 为“折叠轴”大致位置（以手指靠近处为起点）
+        val foldX = fx
 
-        // 2) 绘制 frontRegion（未折叠）
+        // 2. 绘制 frontRegion（未被折叠的左侧/右侧区域）
+        // 构造 front path = 全页 - fold area (右半被拉起为例)
+        val foldPath = Path().apply {
+            // 使用 sin 曲线近似 fold 上边界： y = H * sin(pi * (x - foldStart) / foldWidth)
+            // 为简单稳定，使用一段二次贝塞尔：从 foldX 到 cornerX
+            val cx = (foldX + cornerX) / 2f
+            reset()
+            moveTo(0f, 0f)
+            if (mDirection == PageDirection.NEXT) {
+                // 对 NEXT（右向左翻），未折叠区为 [0, foldX)
+                lineTo(foldX, 0f)
+                // 折叠上边界到 corner
+                quadTo(cx, H * 0.6f, cornerX, 0f)
+                lineTo(cornerX, viewHeight.toFloat())
+                quadTo(cx, viewHeight - H * 0.6f, foldX, viewHeight.toFloat())
+                close()
+            } else {
+                // PREV（左向右翻），未折叠区为 (foldX, width]
+                moveTo(foldX, 0f)
+                lineTo(viewWidth.toFloat(), 0f)
+                lineTo(viewWidth.toFloat(), viewHeight.toFloat())
+                lineTo(foldX, viewHeight.toFloat())
+                close()
+            }
+        }
+
+        // frontRegion = fullRect - foldPath (we want to draw the non-folded portion of cur page)
+        val frontPath = Path()
+        frontPath.addRect(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat(), Path.Direction.CW)
+        frontPath.op(foldPath, Path.Op.DIFFERENCE)
+
+        // draw front (clipped)
         canvas.withSave {
-            clipPath(pathFront)
+            clipPath(frontPath)
             curRecorder.draw(this)
         }
 
-        // 3) 绘制 foldRegion（折叠区域：背面 + 变形 + 阴影）
-        // 在一个 layer 上绘制 fold 区域，以便做变换和混合
-        val layer = canvas.saveLayer(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat(), null)
+        // 3. 绘制 fold 区域：使用 drawBitmapMesh 做竖向弯曲变形（对 bmp 的右侧或左侧部分）
+        // mesh 网格生成（按 fold side 只对被翻起那半进行变形）
+        createMeshIfNeeded(bmp.width, bmp.height)
 
-        // 裁剪到 foldRegion，然后把当前页内容绘制到该区域（作为“纸张被折叠的部分”原图）
-        canvas.withSave {
-            clipPath(pathFold)
-            curRecorder.draw(this)
-        }
+        val verts = meshVerts ?: return
 
-        // 取出 fold 区域中心 x，用于矩阵变换的 pivot
-        val foldCenterX = (cx + cornerX) / 2f
-        val foldCenterY = viewHeight / 2f
+        // 生成顶点变形：对每列 x，计算 y-offset = sin(pi * (x - foldStart) / foldWidth) * H
+        val cols = meshCols
+        val step = viewWidth.toFloat() / cols
 
-        // 使用 Camera 旋转来模拟“翻起”的 3D 效果
-        val dragRatio = ((viewWidth - baseDist) / viewWidth).coerceIn(0f, 1f)
-        val rotateY = (if (mDirection == PageDirection.NEXT) -1 else 1) * (45f * (0.6f + 0.4f * dragRatio))
-
-        camera.save()
-        camera.rotateY(rotateY)
-        camera.getMatrix(matrix)
-        camera.restore()
-
-        // 以 fold 中心做 pre/post translate
-        matrix.preTranslate(-foldCenterX, -foldCenterY)
-        matrix.postTranslate(foldCenterX, foldCenterY)
-
-        // 将 layer 中裁剪出来的“折叠内容”进行变换（即把折叠的那部分旋起来）
-        canvas.concat(matrix)
-
-        // 为背面加上半透明填充（模拟纸背），并稍微调暗以表现背面材质
-        canvas.withSave {
-            // 背面绘制：把 curRecorder 内容再绘一次（被翻过来的背面）
-            // 由于 curRecorder.draw() 会绘制整页，我们需要只绘制 foldRegion 的部分，矩阵已限制
-            // 使用一个透明度使其看起来像纸张背面
-            paint.alpha = 200
-            // draw the flipped content - using curRecorder (it will be clipped by foldRegion/matrix)
-            curRecorder.draw(this)
-            // 叠加半透明蒙版以区分正面/背面
-            drawRect(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat(), paint.apply { color = 0x66FFFFFF.toInt() })
-        }
-
-        // 恢复到 layer（matrix 上的绘制已经完成）
-        canvas.restoreToCount(layer)
-
-        // 4) 阴影 - 在折叠边缘添加渐变阴影
-        val shadowWidth = (maxShadowWidth * (0.3f + 0.7f * dragRatio)).coerceAtMost(maxShadowWidth)
-        val shadowRect = if (mDirection == PageDirection.NEXT) {
-            // 阴影位于 fold 的左侧（揭开的下一页与折叠边之间）
-            tmpRect.set(cx, 0f, cx + shadowWidth, viewHeight.toFloat())
-            tmpRect
+        // 根据翻页方向，fold region 是右侧（NEXT）或左侧（PREV）
+        if (mDirection == PageDirection.NEXT) {
+            // we move right-side area: for vertices whose x >= foldX do deformation
+            var idx = 0
+            for (row in 0..meshRows) {
+                val ry = row * (viewHeight.toFloat() / meshRows)
+                for (c in 0..cols) {
+                    val x = c * (viewWidth.toFloat() / cols)
+                    val offset = if (x >= foldX) {
+                        // normalized t in [0,1] where 0 at foldX and 1 at cornerX
+                        val t = ((x - foldX) / max(1f, (viewWidth - foldX))).coerceIn(0f, 1f)
+                        // y displacement by sin curve: amplitude H * sin(pi * t)
+                        val yOff = (H * sin(PI * t)).toFloat()
+                        // apply vertical displacement towards center (positive pushes downward)
+                        yOff * (if (row == 0) -1 else 1) * 0.5f // top row negative, bottom positive for curvature
+                    } else 0f
+                    // store vertex: x, y + offset
+                    verts[idx++] = x
+                    verts[idx++] = ry + offset
+                }
+            }
         } else {
-            tmpRect.set(cx - shadowWidth, 0f, cx, viewHeight.toFloat())
-            tmpRect
+            // PREV: left side deforms (x <= foldX)
+            var idx = 0
+            for (row in 0..meshRows) {
+                val ry = row * (viewHeight.toFloat() / meshRows)
+                for (c in 0..cols) {
+                    val x = c * (viewWidth.toFloat() / cols)
+                    val offset = if (x <= foldX) {
+                        val t = (1f - (x / max(1f, foldX))).coerceIn(0f, 1f)
+                        val yOff = (H * sin(PI * t)).toFloat()
+                        yOff * (if (row == 0) -1 else 1) * 0.5f
+                    } else 0f
+                    verts[idx++] = x
+                    verts[idx++] = ry + offset
+                }
+            }
         }
-        canvas.drawRect(shadowRect, shadowPaint)
 
-        // 5) 高光（沿曲率顶部）增强真实感（轻微）
-        val highlightWidth = 30f * dragRatio
-        if (highlightWidth > 1f) {
-            canvas.drawRect(
-                if (mDirection == PageDirection.NEXT) cx else cx - highlightWidth,
-                0f,
-                if (mDirection == PageDirection.NEXT) cx + highlightWidth else cx,
-                viewHeight.toFloat(),
-                highlightPaint
-            )
+        // draw bitmap mesh (only draw the full bitmap, but the deformations affect visually)
+        canvas.withSave {
+            // clip to foldPath so only fold region shows deformed mesh
+            clipPath(foldPath)
+            // draw the whole bitmap with transformed verts
+            canvas.drawBitmapMesh(bmp, cols, meshRows, verts, 0, null, 0, paint)
         }
+
+        // 4. 背面半透明：在 fold region 上绘制半透明冷色矩形（或直接对变形部分再绘一次 bitmap 并调色）
+        canvas.withSave {
+            clipPath(foldPath)
+            // 叠加冷色蒙层，模拟纸背（可改为 drawBitmap with ColorMatrix）
+            drawRect(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat(), backPaint.apply {
+                color = if (mDirection == PageDirection.NEXT) 0xCCB0CFE0.toInt() else 0xCCB0CFE0.toInt()
+            })
+        }
+
+        // 5. 阴影：沿 fold 边绘制窄带渐变
+        val shadowW = (max(20f, 80f * (H / viewHeight))).coerceAtMost(120f)
+        val shadowRect = if (mDirection == PageDirection.NEXT) {
+            RectF(foldX, 0f, foldX + shadowW, viewHeight.toFloat())
+        } else {
+            RectF(foldX - shadowW, 0f, foldX, viewHeight.toFloat())
+        }
+        // 更新 shader 位置（简单方法：重-create shader 每帧，或使用 matrix 平移）
+        shadowPaint.shader = LinearGradient(
+            shadowRect.left, 0f, shadowRect.right, 0f,
+            intArrayOf(0x88000000.toInt(), 0x22000000.toInt(), 0x00000000),
+            floatArrayOf(0f, 0.5f, 1f),
+            Shader.TileMode.CLAMP
+        )
+        canvas.drawRect(shadowRect, shadowPaint)
     }
 
-    // 将页面内容截图到 recorder（在动画开始前或切页前调用）
+    // --- setBitmap: 将渲染准备好的页面截图到 recorder/bitmap（调用前 mDirection 要已经设置） ---
     override fun setBitmap() {
+        // 使用 curPage/nextPage/prevPage.draw(canvasBitmap) 将内容放到 pageBitmap
+        ensurePageBitmap()
         when (mDirection) {
             PageDirection.NEXT -> {
-                // current -> curRecorder, next -> nextRecorder
-                curPage.screenshot(curRecorder)
-                nextPage.screenshot(nextRecorder)
+                // current-> bitmap, next page as background already drawn in onDraw by nextRecorder
+                curPage.draw(pageBitmapCanvas)
             }
             PageDirection.PREV -> {
-                curPage.screenshot(curRecorder)
-                prevPage.screenshot(prevRecorder)
+                curPage.draw(pageBitmapCanvas)
             }
-            else -> Unit
+            else -> curPage.draw(pageBitmapCanvas)
         }
     }
 
     override fun setViewSize(width: Int, height: Int) {
         super.setViewSize(width, height)
+        // recreate bitmap when size changed
+        recyclePageBitmap()
+        ensurePageBitmap()
         cornerY = height.toFloat()
     }
 
-    // 动画启动：根据 isCancel 决定回弹或完成翻页，使用 startScroll 发起平滑过渡
     override fun onAnimStart(animationSpeed: Int) {
-        // 计算目标移动量（水平）
-        val baseDist = abs(cornerX - touchX)
-        val dragRatio = (baseDist / viewWidth).coerceIn(0f, 1f)
-
-        val distanceX = if (isCancel) {
-            // 回弹：移动回起点
-            if (mDirection == PageDirection.NEXT) (viewWidth - touchX).toInt() else -(touchX).toInt()
+        // 依据 isCancel 决定目标平移：如果完成翻页，则把 fold 推到页面另一侧，否则回弹到原来位置
+        val targetDx = if (isCancel) {
+            // 回弹：移动到起点（touch->start）
+            (startX - touchX).toInt()
         } else {
-            // 完成翻页：把折叠继续推完
+            // 完成翻页：将折叠推进到底（大致移动量 viewWidth）
             if (mDirection == PageDirection.NEXT) -((viewWidth + touchX)).toInt() else ((viewWidth - touchX)).toInt()
         }
-
-        // 使用 startScroll 来驱动 scroller，基类会在 computeScroll 调用 setTouchPoint
-        startScroll(touchX.toInt(), 0, distanceX, 0, animationSpeed)
+        // startScroll 的参数：startX, startY, dx, dy, animationSpeed
+        startScroll(touchX.toInt(), 0, targetDx, 0, animationSpeed)
     }
 
     override fun onAnimStop() {
-        // 动画完成：如果不是取消则切页
         if (!isCancel) {
             readView.fillPage(mDirection)
         } else {
-            // 回弹时仅重绘回原位
+            // 回弹到原位，清理状态
             readView.invalidate()
         }
-        // 重置状态
         isRunning = false
         isStarted = false
     }
 
     override fun abortAnim() {
-        // 中断 scroller，重置状态
         if (!scroller.isFinished) {
             readView.isAbortAnim = true
             scroller.abortAnimation()
@@ -297,5 +321,31 @@ class CurlPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
         readView.setStartPoint(viewWidth * 0.1f, viewHeight / 2f, false)
         setBitmap()
         onAnimStart(animationSpeed)
+    }
+
+    // --- 辅助：创建/回收 bitmap 与 mesh 数组 ---
+    private fun ensurePageBitmap() {
+        if (pageBitmap == null || pageBitmap?.width != viewWidth || pageBitmap?.height != viewHeight) {
+            recyclePageBitmap()
+            if (viewWidth > 0 && viewHeight > 0) {
+                pageBitmap = Bitmap.createBitmap(viewWidth, viewHeight, Bitmap.Config.ARGB_8888)
+                pageBitmapCanvas = Canvas(pageBitmap!!)
+                // init mesh
+                meshVerts = FloatArray((meshCols + 1) * (meshRows + 1) * 2)
+            }
+        }
+    }
+
+    private fun recyclePageBitmap() {
+        pageBitmapCanvas = null
+        pageBitmap?.recycle()
+        pageBitmap = null
+        meshVerts = null
+    }
+
+    private fun createMeshIfNeeded(bmpW: Int, bmpH: Int) {
+        if (meshVerts == null) {
+            meshVerts = FloatArray((meshCols + 1) * (meshRows + 1) * 2)
+        }
     }
 }
