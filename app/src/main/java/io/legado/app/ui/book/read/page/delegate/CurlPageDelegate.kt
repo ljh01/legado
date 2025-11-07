@@ -1,18 +1,21 @@
 package io.legado.app.ui.book.read.page.delegate
 
 import android.graphics.*
+import android.os.Build
 import android.view.MotionEvent
 import androidx.core.graphics.withSave
+import androidx.core.graphics.withTranslation
 import io.legado.app.ui.book.read.page.ReadView
 import io.legado.app.ui.book.read.page.entities.PageDirection
+import io.legado.app.utils.screenshot
 import kotlin.math.*
 
 /**
  * CurlPageDelegate - 基于 Bitmap mesh 的贝塞尔/正弦弯曲纸页翻页（接近 Google Play Books / 静读天下）
  *
  * 设计说明（要点）：
- *  - 使用 curPage.draw(bitmapCanvas) 生成当前页 bitmap（避免依赖不可预知的 recorder bitmap API）
- *  - 将 bitmap 按网格分段，通过 drawBitmapMesh 实现“纸张沿竖直方向弯曲”的视觉（y = H * sin(pi * x / width)）
+ *  - 使用 curPage.screenshot() 生成当前页 bitmap（避免依赖不可预知的 recorder bitmap API）
+ *  - 将 bitmap 按网格分段，通过 drawBitmapMesh 实现"纸张沿竖直方向弯曲"的视觉（y = H * sin(pi * x / width)）
  *  - 同时对背面区域使用半透明冷色叠加以模拟纸的背面
  *  - 阴影使用 LinearGradient 渐变，位置随折叠线（foldX）移动
  *
@@ -32,7 +35,6 @@ class CurlPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
 
     // 临时缓存 bitmap（避免频繁分配）
     private var pageBitmap: Bitmap? = null
-    private var pageBitmapCanvas: Canvas? = null
     private var meshVerts: FloatArray? = null
 
     // 折叠控制
@@ -41,6 +43,7 @@ class CurlPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
 
     init {
         paint.style = Paint.Style.FILL
+
         // 阴影（将按 fold 方向绘制）
         shadowPaint.shader = LinearGradient(
             0f, 0f, 200f, 0f,
@@ -48,8 +51,8 @@ class CurlPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
             floatArrayOf(0f, 0.5f, 1f),
             Shader.TileMode.CLAMP
         )
+
         // 背面颜色（冷灰），半透明
-        backPaint.colorFilter = null
         backPaint.alpha = 220
     }
 
@@ -58,8 +61,10 @@ class CurlPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
                 abortAnim()
+
                 // 决定翻页方向：右半屏向左（NEXT），左半屏向右（PREV）
                 val dragToLeft = event.x > viewWidth / 2f
+
                 if (dragToLeft) {
                     if (!hasNext()) return
                     setDirection(PageDirection.NEXT)
@@ -69,28 +74,25 @@ class CurlPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
                     setDirection(PageDirection.PREV)
                     cornerX = 0f
                 }
+
                 cornerY = viewHeight.toFloat()
                 readView.setStartPoint(event.x, event.y, false)
                 isRunning = true
-                // 生成或更新 bitmap 缓存
-                ensurePageBitmap()
-                // 截图当前页到 bitmap
-                curPage.draw(pageBitmapCanvas)
             }
 
             MotionEvent.ACTION_MOVE -> {
                 if (isRunning) {
                     readView.setTouchPoint(event.x, event.y)
-                    // 每次移动可以更新 bitmap（如果你用 recorder 直接提供 bitmap 可跳过）
-                    // curPage.draw(pageBitmapCanvas) // 可选：减小频率以提升性能
                 }
             }
 
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 if (!isRunning) return
+
                 // 判断是否完成翻页（水平拖动阈值）
                 val dragDist = abs(touchX - startX)
                 isCancel = dragDist < viewWidth * 0.25f
+
                 // 启动收尾动画
                 onAnimStart(readView.defaultAnimationSpeed)
             }
@@ -114,24 +116,22 @@ class CurlPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
 
         // 确保 bitmap 可用
         ensurePageBitmap()
-
         val bmp = pageBitmap ?: return
 
         // 计算 fold 关键变量
         val fx = touchX.coerceIn(0f, viewWidth.toFloat())   // 手指X
         val fy = touchY.coerceIn(0f, viewHeight.toFloat())  // 手指Y
         val baseDist = abs(cornerX - fx)
+
         // H 控制弧高，相对 viewHeight
         val H = (min(maxCurve, 0.75f * (1f - baseDist / viewWidth)) * viewHeight).coerceAtLeast(0f)
 
-        // foldX 为“折叠轴”大致位置（以手指靠近处为起点）
+        // foldX 为"折叠轴"大致位置（以手指靠近处为起点）
         val foldX = fx
 
         // 2. 绘制 frontRegion（未被折叠的左侧/右侧区域）
-        // 构造 front path = 全页 - fold area (右半被拉起为例)
+        // 构造 fold path = 折叠区域
         val foldPath = Path().apply {
-            // 使用 sin 曲线近似 fold 上边界： y = H * sin(pi * (x - foldStart) / foldWidth)
-            // 为简单稳定，使用一段二次贝塞尔：从 foldX 到 cornerX
             val cx = (foldX + cornerX) / 2f
             reset()
             moveTo(0f, 0f)
@@ -156,7 +156,22 @@ class CurlPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
         // frontRegion = fullRect - foldPath (we want to draw the non-folded portion of cur page)
         val frontPath = Path()
         frontPath.addRect(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat(), Path.Direction.CW)
-        frontPath.op(foldPath, Path.Op.DIFFERENCE)
+        
+        // Path.op 在不同 API 级别有不同的用法
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+            frontPath.op(foldPath, Path.Op.DIFFERENCE)
+        } else {
+            // API < 19 使用 Region
+            val region = Region()
+            val clipRegion = Region()
+            region.setPath(frontPath, Region())
+            clipRegion.setPath(foldPath, Region())
+            region.op(clipRegion, Region.Op.DIFFERENCE)
+            frontPath.reset()
+            val rect = Rect()
+            val iterator = region.getBoundaryPath()
+            frontPath.addPath(iterator)
+        }
 
         // draw front (clipped)
         canvas.withSave {
@@ -167,7 +182,6 @@ class CurlPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
         // 3. 绘制 fold 区域：使用 drawBitmapMesh 做竖向弯曲变形（对 bmp 的右侧或左侧部分）
         // mesh 网格生成（按 fold side 只对被翻起那半进行变形）
         createMeshIfNeeded(bmp.width, bmp.height)
-
         val verts = meshVerts ?: return
 
         // 生成顶点变形：对每列 x，计算 y-offset = sin(pi * (x - foldStart) / foldWidth) * H
@@ -190,6 +204,7 @@ class CurlPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
                         // apply vertical displacement towards center (positive pushes downward)
                         yOff * (if (row == 0) -1 else 1) * 0.5f // top row negative, bottom positive for curvature
                     } else 0f
+
                     // store vertex: x, y + offset
                     verts[idx++] = x
                     verts[idx++] = ry + offset
@@ -207,6 +222,7 @@ class CurlPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
                         val yOff = (H * sin(PI * t)).toFloat()
                         yOff * (if (row == 0) -1 else 1) * 0.5f
                     } else 0f
+
                     verts[idx++] = x
                     verts[idx++] = ry + offset
                 }
@@ -225,9 +241,8 @@ class CurlPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
         canvas.withSave {
             clipPath(foldPath)
             // 叠加冷色蒙层，模拟纸背（可改为 drawBitmap with ColorMatrix）
-            drawRect(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat(), backPaint.apply {
-                color = if (mDirection == PageDirection.NEXT) 0xCCB0CFE0.toInt() else 0xCCB0CFE0.toInt()
-            })
+            backPaint.color = 0xCCB0CFE0.toInt()
+            canvas.drawRect(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat(), backPaint)
         }
 
         // 5. 阴影：沿 fold 边绘制窄带渐变
@@ -237,6 +252,7 @@ class CurlPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
         } else {
             RectF(foldX - shadowW, 0f, foldX, viewHeight.toFloat())
         }
+
         // 更新 shader 位置（简单方法：重-create shader 每帧，或使用 matrix 平移）
         shadowPaint.shader = LinearGradient(
             shadowRect.left, 0f, shadowRect.right, 0f,
@@ -249,17 +265,25 @@ class CurlPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
 
     // --- setBitmap: 将渲染准备好的页面截图到 recorder/bitmap（调用前 mDirection 要已经设置） ---
     override fun setBitmap() {
-        // 使用 curPage/nextPage/prevPage.draw(canvasBitmap) 将内容放到 pageBitmap
+        // 使用 screenshot 方法将页面内容放到 bitmap
         ensurePageBitmap()
         when (mDirection) {
             PageDirection.NEXT -> {
-                // current-> bitmap, next page as background already drawn in onDraw by nextRecorder
-                curPage.draw(pageBitmapCanvas)
+                curPage.screenshot(curRecorder)
+                // 将 recorder 内容绘制到 bitmap
+                val canvas = Canvas(pageBitmap!!)
+                curRecorder.draw(canvas)
             }
             PageDirection.PREV -> {
-                curPage.draw(pageBitmapCanvas)
+                curPage.screenshot(curRecorder)
+                val canvas = Canvas(pageBitmap!!)
+                curRecorder.draw(canvas)
             }
-            else -> curPage.draw(pageBitmapCanvas)
+            else -> {
+                curPage.screenshot(curRecorder)
+                val canvas = Canvas(pageBitmap!!)
+                curRecorder.draw(canvas)
+            }
         }
     }
 
@@ -280,6 +304,7 @@ class CurlPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
             // 完成翻页：将折叠推进到底（大致移动量 viewWidth）
             if (mDirection == PageDirection.NEXT) -((viewWidth + touchX)).toInt() else ((viewWidth - touchX)).toInt()
         }
+
         // startScroll 的参数：startX, startY, dx, dy, animationSpeed
         startScroll(touchX.toInt(), 0, targetDx, 0, animationSpeed)
     }
@@ -309,6 +334,8 @@ class CurlPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
         abortAnim()
         if (!hasNext()) return
         setDirection(PageDirection.NEXT)
+        cornerX = viewWidth.toFloat()
+        cornerY = viewHeight.toFloat()
         readView.setStartPoint(viewWidth * 0.9f, viewHeight / 2f, false)
         setBitmap()
         onAnimStart(animationSpeed)
@@ -318,6 +345,8 @@ class CurlPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
         abortAnim()
         if (!hasPrev()) return
         setDirection(PageDirection.PREV)
+        cornerX = 0f
+        cornerY = viewHeight.toFloat()
         readView.setStartPoint(viewWidth * 0.1f, viewHeight / 2f, false)
         setBitmap()
         onAnimStart(animationSpeed)
@@ -329,7 +358,6 @@ class CurlPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
             recyclePageBitmap()
             if (viewWidth > 0 && viewHeight > 0) {
                 pageBitmap = Bitmap.createBitmap(viewWidth, viewHeight, Bitmap.Config.ARGB_8888)
-                pageBitmapCanvas = Canvas(pageBitmap!!)
                 // init mesh
                 meshVerts = FloatArray((meshCols + 1) * (meshRows + 1) * 2)
             }
@@ -337,7 +365,6 @@ class CurlPageDelegate(readView: ReadView) : HorizontalPageDelegate(readView) {
     }
 
     private fun recyclePageBitmap() {
-        pageBitmapCanvas = null
         pageBitmap?.recycle()
         pageBitmap = null
         meshVerts = null
